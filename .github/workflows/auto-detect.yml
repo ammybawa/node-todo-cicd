@@ -1,0 +1,313 @@
+name: Auto Detect, Build & Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Quieter Node 20 deprecation warnings until artifact actions default to Node 24
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      python: ${{ steps.detect.outputs.python }}
+      node: ${{ steps.detect.outputs.node }}
+      html: ${{ steps.detect.outputs.html }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect project type
+        id: detect
+        run: |
+          echo "python=false" >> "$GITHUB_OUTPUT"
+          echo "node=false" >> "$GITHUB_OUTPUT"
+          echo "html=false" >> "$GITHUB_OUTPUT"
+
+          if [ -f requirements.txt ] || [ -f pyproject.toml ] || [ -f Pipfile ] || [ -f setup.py ]; then
+            echo "python=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ -f package.json ]; then
+            echo "node=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Static HTML: any .html in repo root, and not a Node app (Node build handles those)
+          if [ ! -f package.json ] && compgen -G "*.html" > /dev/null; then
+            echo "html=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ───────────────────────────────────────────
+  # PYTHON JOB
+  # ───────────────────────────────────────────
+  python-job:
+    needs: detect
+    if: needs.detect.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          elif [ -f pyproject.toml ]; then
+            pip install .
+          fi
+
+      - name: Verify Python sources
+        run: |
+          cnt=$(find . -name "*.py" -not -path "./.git/*" -not -path "./_python_staging/*" | wc -l)
+          if [ "$cnt" -gt 0 ]; then
+            find . -name "*.py" -not -path "./.git/*" -not -path "./_python_staging/*" -print0 | xargs -0 -r python -m py_compile
+          else
+            echo "No Python files found to compile"
+          fi
+
+      - name: Run tests (if pytest configured)
+        continue-on-error: true
+        run: |
+          if [ -f pytest.ini ] || [ -f setup.cfg ] || [ -f tox.ini ]; then
+            pip install pytest -q
+            pytest -q
+          elif [ -f pyproject.toml ] && grep -q '\[tool.pytest' pyproject.toml 2>/dev/null; then
+            pip install pytest -q
+            pytest -q
+          else
+            echo "No pytest configuration found, skipping tests"
+          fi
+
+      - name: Stage Python artifact for deploy
+        run: |
+          mkdir -p _python_staging
+          find . \( -path ./.git -o -path ./_python_staging \) -prune -o \
+            \( -name "*.py" -o -name "requirements.txt" -o -name "pyproject.toml" -o -name "Pipfile" -o -name "Pipfile.lock" \) -print0 |
+            while IFS= read -r -d '' f; do
+              install -D "$f" "_python_staging/$f"
+            done
+
+      - name: Upload Python artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-build
+          path: _python_staging/
+          if-no-files-found: warn
+
+  # ───────────────────────────────────────────
+  # NODE JOB
+  # ───────────────────────────────────────────
+  node-job:
+    needs: detect
+    if: needs.detect.outputs.node == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci || npm install
+        env:
+          SHARP_IGNORE_GLOBAL_LIBVIPS: "1"
+
+      - name: Rebuild native modules (optional)
+        continue-on-error: true
+        run: |
+          if npm ls @tailwindcss/oxide >/dev/null 2>&1; then
+            npm rebuild @tailwindcss/oxide --update-binary || npm install @tailwindcss/oxide --no-save
+          else
+            echo "No @tailwindcss/oxide in tree, skipping rebuild"
+          fi
+
+      - name: Run build (if script exists)
+        run: npm run build --if-present
+
+      - name: Resolve build output directory
+        id: outdir
+        run: |
+          if [ -d dist ]; then echo "dir=dist" >> "$GITHUB_OUTPUT"
+          elif [ -d out ]; then echo "dir=out" >> "$GITHUB_OUTPUT"
+          elif [ -d build ]; then echo "dir=build" >> "$GITHUB_OUTPUT"
+          else echo "dir=." >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload Node artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-build
+          path: ${{ steps.outdir.outputs.dir }}/
+          if-no-files-found: warn
+
+  # ───────────────────────────────────────────
+  # HTML JOB
+  # ───────────────────────────────────────────
+  html-job:
+    needs: detect
+    if: needs.detect.outputs.html == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stage static site for deploy
+        run: |
+          mkdir -p _html_staging
+          find . -maxdepth 3 -name "*.html" -not -path "./.git/*" -exec cp {} _html_staging/ \;
+          for d in css js assets img images static public media fonts; do
+            [ -d "$d" ] && cp -r "$d" _html_staging/ || true
+          done
+          ls -la _html_staging
+
+      - name: Upload HTML artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: html-build
+          path: _html_staging/
+          if-no-files-found: warn
+
+  # ───────────────────────────────────────────
+  # DEPLOY (push to main only)
+  # ───────────────────────────────────────────
+  deploy:
+    needs: [detect, python-job, node-job, html-job]
+    if: |
+      always() &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      (
+        (needs.detect.outputs.node == 'true' && needs.node-job.result == 'success') ||
+        (needs.detect.outputs.python == 'true' && needs.python-job.result == 'success') ||
+        (needs.detect.outputs.html == 'true' && needs.html-job.result == 'success')
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Node artifact
+        if: needs.detect.outputs.node == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: node-build
+          path: deploy/
+
+      - name: Download HTML artifact
+        if: needs.detect.outputs.html == 'true' && needs.detect.outputs.node != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: html-build
+          path: deploy/
+
+      - name: Download Python artifact
+        if: needs.detect.outputs.python == 'true' && needs.detect.outputs.node != 'true' && needs.detect.outputs.html != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: python-build
+          path: deploy/
+
+      - name: Verify deploy files
+        run: |
+          echo "=== Files to deploy ==="
+          ls -laR deploy/ 2>/dev/null || true
+
+      - name: Ensure deploy/ is not empty before SCP
+        if: |
+          needs.detect.outputs.node == 'true' || needs.detect.outputs.html == 'true' ||
+          (needs.detect.outputs.python == 'true' && needs.detect.outputs.node != 'true' && needs.detect.outputs.html != 'true')
+        run: |
+          if [ ! -d deploy ] || [ -z "$(ls -A deploy 2>/dev/null)" ]; then
+            echo "::error::deploy/ is missing or empty (nothing to upload). Check build output and artifact download path."
+            ls -la
+            exit 1
+          fi
+
+      - name: Copy files to server (Node / HTML static)
+        if: needs.detect.outputs.node == 'true' || needs.detect.outputs.html == 'true'
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          port: ${{ secrets.SSH_PORT != '' && secrets.SSH_PORT || '22' }}
+          timeout: 2m
+          command_timeout: 15m
+          source: "deploy/*"
+          target: ${{ secrets.DEPLOY_PATH }}
+          rm: false
+          overwrite: true
+
+      - name: Copy Python app to server
+        if: needs.detect.outputs.python == 'true' && needs.detect.outputs.node != 'true' && needs.detect.outputs.html != 'true'
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          port: ${{ secrets.SSH_PORT != '' && secrets.SSH_PORT || '22' }}
+          timeout: 2m
+          command_timeout: 15m
+          source: "deploy/*"
+          target: ${{ secrets.DEPLOY_PATH }}
+          rm: false
+          overwrite: true
+
+      - name: Remote commands after deploy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          port: ${{ secrets.SSH_PORT != '' && secrets.SSH_PORT || '22' }}
+          timeout: 2m
+          command_timeout: 15m
+          script: |
+            set -e
+            echo "=== Deployment ==="
+            cd "${{ secrets.DEPLOY_PATH }}"
+            ls -la
+
+            if [ "${{ needs.detect.outputs.python }}" = "true" ] && [ "${{ needs.detect.outputs.node }}" != "true" ] && [ "${{ needs.detect.outputs.html }}" != "true" ]; then
+              if [ -f requirements.txt ]; then
+                python3 -m pip install --user -r requirements.txt || pip3 install -r requirements.txt
+              fi
+              # Uncomment if you run the app under systemd/pm2/gunicorn:
+              # sudo systemctl restart your-python-service
+            fi
+
+            if [ "${{ needs.detect.outputs.node }}" = "true" ]; then
+              PM2_NAME="${{ secrets.PM2_APP_NAME }}"
+              if [ -n "$PM2_NAME" ]; then
+                if command -v pm2 >/dev/null 2>&1; then
+                  pm2 restart "$PM2_NAME"
+                  pm2 save || true
+                  echo "PM2 restarted: $PM2_NAME"
+                else
+                  echo "PM2_APP_NAME is set but pm2 not found in PATH"; exit 1
+                fi
+              else
+                echo "PM2_APP_NAME secret empty — skipping PM2 (set it to your process name from pm2 list)"
+              fi
+            fi
+
+            if [ "${{ needs.detect.outputs.node }}" = "true" ] || [ "${{ needs.detect.outputs.html }}" = "true" ]; then
+              sudo systemctl reload nginx || true
+              echo "Nginx reload attempted (ignore if you use Apache only)"
+            fi
+
+            echo "=== Done ==="
+
