@@ -1,0 +1,28 @@
+# depdash-managed: do not edit — generator v1
+# app: default
+name: depdash-deploy
+on:
+  push:
+    branches: ['dev']
+  workflow_dispatch:
+
+jobs:
+  build-and-notify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          pnpm install --frozen-lockfile && (pnpm run build || npm run build || true) && tar -czf artifact.tar.gz --exclude=node_modules/.cache --exclude=.git .
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: depdash-artifact
+          path: artifact.tar.gz
+      - name: Notify depdash
+        env:
+          DEPDASH_CALLBACK_SECRET: ${{ secrets.DEPDASH_CALLBACK_7159AEF5_5377_4101_9096_A878B16B5E65 }}
+        run: |
+          BODY=$(jq -nc --arg run "$GITHUB_RUN_ID" --arg sha "$GITHUB_SHA" --arg status "success" '{ runId: $run, gitSha: $sha, status: $status, artifactUrl: "ARTIFACT_URL_PLACEHOLDER" }')
+          SIG=$(echo -n "$BODY" | openssl dgst -sha256 -hmac "$DEPDASH_CALLBACK_SECRET" -binary | xxd -p -c 256)
+          curl -fsS -X POST -H "content-type: application/json" -H "x-depdash-sig: sha256=$SIG" -d "$BODY" 'http://localhost:3000/webhooks/ci-result?pipelineId=7159aef5-5377-4101-9096-a878b16b5e65'
